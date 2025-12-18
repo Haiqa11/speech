@@ -1,11 +1,19 @@
 import streamlit as st
 import numpy as np
 import librosa
-import tensorflow as tf
-from tensorflow import keras
 import tempfile
 import os
 from pathlib import Path
+
+# Try to import TensorFlow locally; on Streamlit Cloud this may fail.
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    HAS_TF = True
+except Exception:
+    tf = None
+    keras = None
+    HAS_TF = False
 
 # Page config
 st.set_page_config(
@@ -21,29 +29,46 @@ SAMPLES_PER_TRACK = int(SAMPLE_RATE * DURATION)
 N_MFCC = 60
 TARGET_EMOTIONS = ["neutral", "happy", "sad", "angry", "fearful", "disgust"]
 
-# Custom layer for loading the model
-class SumContext(tf.keras.layers.Layer):
-    """Time-wise weighted sum: sum_t (x_t * a_t)."""
-    def call(self, inputs):
-        x, attn = inputs  # x: (B,T,F), attn: (B,T,1)
-        return tf.reduce_sum(x * attn, axis=1)  # (B,F)
+# Custom layer for loading the model (only if TensorFlow is available)
+if HAS_TF:
+    class SumContext(tf.keras.layers.Layer):
+        """Time-wise weighted sum: sum_t (x_t * a_t)."""
+        def call(self, inputs):
+            x, attn = inputs  # x: (B,T,F), attn: (B,T,1)
+            return tf.reduce_sum(x * attn, axis=1)  # (B,F)
 
-    def get_config(self):
-        return super().get_config()
+        def get_config(self):
+            return super().get_config()
+else:
+    # Dummy placeholder so code still imports
+    class SumContext:  # type: ignore
+        pass
 
 @st.cache_resource
 def load_model():
-    """Load the trained emotion recognition model"""
+    """Load the trained emotion recognition model (local only).
+
+    On platforms without TensorFlow (e.g. Streamlit Cloud Python 3.13),
+    this returns None and the app falls back to a demo predictor.
+    """
+    if not HAS_TF:
+        # On cloud: no TF, run in demo mode
+        st.warning(
+            "TensorFlow is not available in this environment. "
+            "Running in demo mode with simulated predictions."
+        )
+        return None
+
     model_path = "saved_models/ser_baseline.h5"
-    
+
     # Try alternative paths if the default doesn't work
     if not os.path.exists(model_path):
         model_path = "ser_baseline.h5"
-    
+
     if not os.path.exists(model_path):
         st.error("Model file not found! Please ensure 'ser_baseline.h5' is in the saved_models folder.")
         return None
-    
+
     try:
         # Register custom layer
         keras.utils.get_custom_objects()['SumContext'] = SumContext
@@ -80,15 +105,28 @@ def preprocess_audio(audio_path):
     return mfcc_features[np.newaxis, ...].astype(np.float32)
 
 def predict_emotion(model, audio_features):
-    """Predict emotion from audio features"""
+    """Predict emotion from audio features.
+
+    - If a real Keras model is available (local run), use it.
+    - If not (e.g. on Streamlit Cloud without TF), return a deterministic
+      mock prediction so the UI still works.
+    """
+    if model is None or not HAS_TF:
+        # Demo mode: simple fixed probability distribution
+        probs = np.array([0.15, 0.15, 0.15, 0.25, 0.15, 0.15])  # bias towards "angry" a bit
+        emotion_idx = int(np.argmax(probs))
+        confidence = float(probs[emotion_idx])
+        all_probs = {TARGET_EMOTIONS[i]: float(probs[i]) for i in range(len(TARGET_EMOTIONS))}
+        return TARGET_EMOTIONS[emotion_idx], confidence, all_probs
+
     predictions = model.predict(audio_features, verbose=0)
     emotion_idx = np.argmax(predictions[0])
-    confidence = predictions[0][emotion_idx]
+    confidence = float(predictions[0][emotion_idx])
     emotion = TARGET_EMOTIONS[emotion_idx]
-    
+
     # Get all probabilities
     all_probs = {TARGET_EMOTIONS[i]: float(predictions[0][i]) for i in range(len(TARGET_EMOTIONS))}
-    
+
     return emotion, confidence, all_probs
 
 # Main app
@@ -96,11 +134,8 @@ st.title("🎤 Speech Emotion Recognition")
 st.markdown("Upload an audio file to detect the emotion in speech")
 st.markdown("---")
 
-# Load model
+# Load model (may be None on cloud / demo)
 model = load_model()
-
-if model is None:
-    st.stop()
 
 # Sidebar
 st.sidebar.header("📋 Instructions")
